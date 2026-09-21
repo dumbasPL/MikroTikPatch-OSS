@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,7 +40,7 @@ patch-v7 options:
   --build-dir <path>         scratch directory (default /tmp/build)
   --publish-dir <path>       output directory (default ./publish)
   --boot-test                boot each built image in qemu and check the licence
-  --boot-test-timeout <s>    per-image boot test timeout (default 600)
+  --boot-test-timeout <s>    per-image boot test timeout, seconds or duration (600)
   --legacy-bios              also build the x86 legacy-BIOS image
   --skip-keygen              do not rebuild keygen_x86/keygen_arm64
   --jobs <n>                 parallel CPU workers (default min(NumCPU,8))
@@ -83,7 +84,8 @@ func cmdPatchV7(args []string) int {
 	buildDir := fs.String("build-dir", "/tmp/build", "scratch directory")
 	publishDir := fs.String("publish-dir", "publish", "output directory")
 	bootTest := fs.Bool("boot-test", false, "boot test the built images")
-	bootTimeout := fs.Duration("boot-test-timeout", 600*time.Second, "boot test timeout")
+	bootTimeout := 600 * time.Second
+	fs.Var(secondsFlag{&bootTimeout}, "boot-test-timeout", "per-image boot test timeout in seconds (default 600)")
 	legacyBIOS := fs.Bool("legacy-bios", false, "build the legacy BIOS image too")
 	skipKeygen := fs.Bool("skip-keygen", false, "do not rebuild the keygen")
 	jobs := fs.Int("jobs", 0, "parallel CPU workers (default min(NumCPU,8))")
@@ -104,7 +106,7 @@ func cmdPatchV7(args []string) int {
 		BuildRoot:       *buildDir,
 		PublishRoot:     *publishDir,
 		BootTest:        *bootTest,
-		BootTestTimeout: *bootTimeout,
+		BootTestTimeout: bootTimeout,
 		LegacyBIOS:      *legacyBIOS,
 		SkipKeygen:      *skipKeygen,
 		Jobs:            *jobs,
@@ -297,10 +299,13 @@ func cmdBootTest(args []string) int {
 	fs := flag.NewFlagSet("boot-test", flag.ExitOnError)
 	socket := fs.String("socket", "", "unix socket of the qemu serial port")
 	pid := fs.Int("pid", 0, "qemu process id")
-	timeout := fs.Duration("timeout", 600*time.Second, "seconds for boot + login + licence")
+	timeout := 600 * time.Second
+	fs.Var(secondsFlag{&timeout}, "timeout", "seconds for boot + login + licence")
 	expect := fs.String("expect", "p-unlimited", "expected licence level")
-	interval := fs.Duration("interval", 5*time.Second, "seconds between licence checks")
-	grace := fs.Duration("grace", 30*time.Second, "seconds to keep retrying after a wrong level")
+	interval := 5 * time.Second
+	fs.Var(secondsFlag{&interval}, "interval", "seconds between licence checks")
+	grace := 30 * time.Second
+	fs.Var(secondsFlag{&grace}, "grace", "seconds to keep retrying after a wrong level")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -311,10 +316,10 @@ func cmdBootTest(args []string) int {
 	err := boottest.Run(boottest.Options{
 		Socket:   *socket,
 		PID:      *pid,
-		Timeout:  *timeout,
+		Timeout:  timeout,
 		Expect:   *expect,
-		Interval: *interval,
-		Grace:    *grace,
+		Interval: interval,
+		Grace:    grace,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -332,6 +337,43 @@ func buildTimeValue(flagValue string) (time.Time, error) {
 		flagValue = os.Getenv("BUILD_TIME")
 	}
 	return npk.ParseBuildTime(flagValue)
+}
+
+// secondsFlag is a flag.Value for timeouts that are documented in seconds but
+// also accept Go duration strings: both "--timeout 600" and "--timeout 10m"
+// work.
+type secondsFlag struct {
+	value *time.Duration
+}
+
+func (f secondsFlag) String() string {
+	if f.value == nil {
+		return "0"
+	}
+	return strconv.FormatInt(int64(f.value.Seconds()), 10)
+}
+
+func (f secondsFlag) Set(s string) error {
+	d, err := parseSeconds(s)
+	if err != nil {
+		return err
+	}
+	*f.value = d
+	return nil
+}
+
+// parseSeconds parses a bare number of seconds ("600", "0.5") or a Go
+// duration string ("10m", "600s").
+func parseSeconds(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if d, err := time.ParseDuration(s); err == nil {
+		return d, nil
+	}
+	seconds, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q (use seconds, e.g. 600, or a duration such as 10m)", s)
+	}
+	return time.Duration(seconds * float64(time.Second)), nil
 }
 
 func environ() map[string]string {

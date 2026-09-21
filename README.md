@@ -56,7 +56,7 @@ Architectures, component signing, downloads and boot tests run in parallel.
 --build-dir <path>         scratch directory (default /tmp/build)
 --publish-dir <path>       output directory (default ./publish)
 --boot-test                boot each image in qemu and check the licence
---boot-test-timeout <s>    per-image timeout (default 600)
+--boot-test-timeout <s>    per-image timeout, seconds or duration (default 600)
 --legacy-bios              also build the x86 legacy-BIOS image
 --skip-keygen              do not rebuild keygen_x86/keygen_arm64
 --jobs <n>                 parallel CPU workers (default min(NumCPU,8))
