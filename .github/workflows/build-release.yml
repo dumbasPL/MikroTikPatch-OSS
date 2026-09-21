@@ -104,6 +104,19 @@ jobs:
             .toolchain/aarch64-musl
           key: musl-toolchains-${{ runner.os }}-${{ hashFiles('tools/musl_i386.sh', 'tools/musl_aarch64.sh') }}
 
+      # The MikroTik CDN is slow from the runners.  Keep the ISOs (which the
+      # pipeline reuses as the source of every package) across runs; a retry
+      # after a failed build then resumes instead of downloading them again.
+      - name: Restore the downloaded ISOs
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ${{ runner.temp }}/build/*/mikrotik-*.iso
+            ${{ runner.temp }}/build/*/mikrotik-*.iso.sha256
+          key: routeros-iso-${{ runner.os }}-${{ inputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            routeros-iso-${{ runner.os }}-${{ inputs.version }}-
+
       # All builds must use one stable key set: patched devices trust the
       # licence public key baked into the keygen, and the NPK signatures.
       - name: Write keys.env
@@ -196,3 +209,14 @@ jobs:
               --title "RouterOS $VERSION" --notes-file "$RUNNER_TEMP/release-notes.md" \
               "${target[@]}" "${extra[@]}" "${assets[@]}"
           fi
+
+      # Save the ISOs even when the build failed, so the next attempt resumes
+      # from them instead of re-downloading from the slow CDN.
+      - name: Save the downloaded ISOs
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ${{ runner.temp }}/build/*/mikrotik-*.iso
+            ${{ runner.temp }}/build/*/mikrotik-*.iso.sha256
+          key: routeros-iso-${{ runner.os }}-${{ inputs.version }}-${{ github.run_id }}-${{ github.run_attempt }}

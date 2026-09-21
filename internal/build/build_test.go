@@ -3,11 +3,19 @@ package build
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestPackagesForArch(t *testing.T) {
@@ -111,6 +119,128 @@ func TestCheckKeygenEmbedded(t *testing.T) {
 	}
 	if err := checkKeygenEmbedded(path, ""); err == nil {
 		t.Error("empty key accepted")
+	}
+}
+
+// rangeServer serves payload with Range support and records the Range header
+// of every request.  With abortFirst the first response is cut short and the
+// connection dropped, like the CDN cancelling a slow transfer.
+func rangeServer(t *testing.T, payload []byte, abortFirst bool) (*httptest.Server, *[]string) {
+	t.Helper()
+	var mu sync.Mutex
+	var ranges []string
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests++
+		attempt := requests
+		ranges = append(ranges, r.Header.Get("Range"))
+		mu.Unlock()
+
+		start := int64(0)
+		if rh := r.Header.Get("Range"); rh != "" {
+			spec, ok := strings.CutPrefix(rh, "bytes=")
+			n, err := strconv.ParseInt(strings.TrimSuffix(spec, "-"), 10, 64)
+			if !ok || err != nil || n < 0 || n > int64(len(payload)) {
+				http.Error(w, "bad range", http.StatusBadRequest)
+				return
+			}
+			start = n
+		}
+		body := payload[start:]
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		if start > 0 {
+			w.Header().Set("Content-Range",
+				fmt.Sprintf("bytes %d-%d/%d", start, len(payload)-1, len(payload)))
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		if abortFirst && attempt == 1 {
+			w.Write(body[:len(body)/2])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			panic(http.ErrAbortHandler)
+		}
+		w.Write(body)
+	}))
+	return srv, &ranges
+}
+
+// TestDownloadResumesPartialFile covers a run that finds a .part file from an
+// earlier attempt: the transfer must continue with a Range request instead of
+// starting over.
+func TestDownloadResumesPartialFile(t *testing.T) {
+	payload := bytes.Repeat([]byte("mikrotik-patch!"), 8192) // 128 KiB
+	srv, ranges := rangeServer(t, payload, false)
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "routeros.npk")
+	if err := os.WriteFile(dest+".part", payload[:4096], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := download(srv.URL, dest); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("downloaded %d bytes (err %v), want %d", len(got), err, len(payload))
+	}
+	if _, err := os.Stat(dest + ".part"); !os.IsNotExist(err) {
+		t.Error(".part file still present after a complete download")
+	}
+	wantSum := sha256.Sum256(payload)
+	if sum, err := os.ReadFile(dest + ".sha256"); err != nil ||
+		strings.TrimSpace(string(sum)) != hex.EncodeToString(wantSum[:]) {
+		t.Errorf("sidecar = %q (err %v)", sum, err)
+	}
+	if len(*ranges) != 1 || (*ranges)[0] != "bytes=4096-" {
+		t.Errorf("server saw ranges %q, want [bytes=4096-]", *ranges)
+	}
+}
+
+// TestDownloadResumesAfterCancelledTransfer covers the retry path: the first
+// attempt dies mid-body (the CDN cancel observed in the workflow) and the
+// second attempt must resume from the partial file.
+func TestDownloadResumesAfterCancelledTransfer(t *testing.T) {
+	payload := bytes.Repeat([]byte("mikrotik-patch!"), 8192) // 128 KiB
+	srv, ranges := rangeServer(t, payload, true)
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "mikrotik.iso")
+	if err := downloadRetry(srv.URL, dest, 3, func(int) time.Duration { return 0 }); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("downloaded %d bytes (err %v), want %d", len(got), err, len(payload))
+	}
+	want := fmt.Sprintf("bytes=%d-", len(payload)/2)
+	if len(*ranges) != 2 || (*ranges)[0] != "" || (*ranges)[1] != want {
+		t.Errorf("server saw ranges %q, want [\"\" %q]", *ranges, want)
+	}
+}
+
+// TestDownloadRestartsWhenRangeIgnored covers a server that answers a Range
+// request with the whole file: the stale partial bytes must be replaced.
+func TestDownloadRestartsWhenRangeIgnored(t *testing.T) {
+	payload := bytes.Repeat([]byte("data"), 4096)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// deliberately no Range/206 support
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		w.Write(payload)
+	}))
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "routeros.npk")
+	if err := os.WriteFile(dest+".part", []byte("stale partial bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := download(srv.URL, dest); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("downloaded %d bytes (err %v), want %d", len(got), err, len(payload))
 	}
 }
 
