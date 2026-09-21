@@ -15,9 +15,12 @@ Requirements:
 * Go 1.24+ with cgo enabled and a C compiler.
 * `liblzma` headers and library (Arch: `xz`; Debian/Ubuntu: `liblzma-dev`).
 * For the keygen: only the toolchain of each architecture you build.
-  `x86` needs a host `gcc` with 32-bit support (the i486 musl toolchain is
-  built on demand); `arm64` needs an aarch64 musl compiler in `PATH`. The
-  pipeline calls `keygen/build.sh [x86] [arm64] [host]` for the requested
+  `x86` needs a host `gcc` with 32-bit support; `arm64` needs an aarch64
+  cross compiler (`gcc-aarch64-linux-gnu` on Debian/Ubuntu, the
+  `aarch64-linux-gnu-gcc` package on Arch). The musl toolchains are built on
+  demand by `tools/musl_i386.sh` and `tools/musl_aarch64.sh`; an
+  `aarch64-linux-musl-gcc` already in `PATH` is used as-is. The pipeline
+  calls `keygen/build.sh [x86] [arm64] [host]` for the requested
   architectures only.
 * `qemu-system-x86_64` / `qemu-system-aarch64` and UEFI firmware (OVMF /
   QEMU_EFI) only for `--boot-test`.
@@ -64,3 +67,38 @@ Architectures, component signing, downloads and boot tests run in parallel.
 ```sh
 ./mikrotikpatch genkeys [--out keys.env]
 ```
+
+## Automated releases
+
+`.github/workflows/check-release.yml` runs hourly and on demand. On a schedule
+it asks `upgrade.mikrotik.com` for the newest RouterOS version on the release
+channel and compares it with the releases in this repository. When the version
+is new (and no release tagged `v<version>` exists yet) it calls
+`.github/workflows/build-release.yml`, which patches both architectures,
+boot-tests the CHR images in QEMU and publishes a release: the body contains
+the upstream changelog and the assets are the CHR images
+(`chr-*.img.zip`), the main packages
+(`routeros-<version>[-<arch>].npk`) and the package archives
+(`all_packages-<arch>-<version>.zip`). Beta and rc versions are marked as
+pre-releases.
+
+Manual runs (**Actions → Check for new RouterOS releases → Run workflow**)
+build the latest or a specific version and upload the result as workflow
+artifacts; tick `create_release` to publish a release instead. Every image is
+boot tested before it is published (`boot_test`, on by default; hosted runners
+have no KVM, so the emulated boot tests are slow). The same inputs are
+available when running **Build patched RouterOS release** directly.
+
+One-time setup:
+
+1. Generate the key set and keep it forever:
+   `./mikrotikpatch genkeys --out keys.env`
+2. Store the complete contents of `keys.env` in a repository secret named
+   `KEYS_ENV` (the build refuses to run without it). Every patched device
+   trusts these keys, so regenerating them invalidates all previous releases.
+3. Optional: set the repository variable `ROUTEROS_CHANNEL` to `long-term`,
+   `testing` or `development` to change the channel the hourly check uses
+   (default `stable`).
+
+GitHub disables scheduled workflows after 60 days without repository activity;
+re-enable the schedule from the Actions tab if that happens.

@@ -26,7 +26,9 @@
 #   x86    i486-linux-musl-gcc / i686-linux-musl-gcc, or the local toolchain
 #          built by tools/musl_i386.sh (run automatically when no i386 musl
 #          compiler is in PATH)
-#   arm64  aarch64-linux-musl-gcc (or .toolchain/aarch64-musl/bin/musl-gcc)
+#   arm64  aarch64-linux-musl-gcc, or the local toolchain built by
+#          tools/musl_aarch64.sh (run automatically when no aarch64 musl
+#          compiler is in PATH)
 #   host   musl-gcc
 set -e
 cd "$(dirname "$0")"
@@ -119,8 +121,12 @@ fi
 if [ "$BUILD_ARM64" -eq 1 ]; then
     ARM_CC=$(find_arm_cc || true)
     if [ -z "$ARM_CC" ]; then
-        echo "ERROR: no aarch64 musl compiler found (set CC_ARM64;" >&2
-        echo "       on Arch install musl-aarch64, on Debian use a musl cross toolchain)" >&2
+        echo "==> no aarch64 musl compiler in PATH; building one (tools/musl_aarch64.sh)"
+        sh "$ROOT/tools/musl_aarch64.sh"
+        ARM_CC=$(find_arm_cc || true)
+    fi
+    if [ -z "$ARM_CC" ]; then
+        echo "ERROR: no aarch64 musl compiler found (set CC_ARM64)" >&2
         exit 1
     fi
     make_stubs

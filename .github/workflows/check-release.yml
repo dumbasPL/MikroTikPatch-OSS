@@ -1,0 +1,165 @@
+name: Check for new RouterOS releases
+
+# Runs on a schedule (and manually).  It asks upgrade.mikrotik.com for the
+# newest RouterOS version on the selected channel and compares it with the
+# releases published in this repository.  When the version is new it calls
+# build-release.yml, which patches the version and creates the release.
+#
+# Manual runs build the selected (or latest) version even when it has already
+# been released; they upload the result as artifacts instead of creating a
+# release unless "create_release" is checked.
+
+on:
+  schedule:
+    # hourly, at :17 (GitHub delays jobs scheduled on the hour)
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: RouterOS version to patch (leave empty for the latest on the channel)
+        required: false
+        default: ""
+        type: string
+      channel:
+        description: RouterOS release channel to check
+        required: true
+        default: stable
+        type: choice
+        options:
+          - long-term
+          - stable
+          - testing
+          - development
+      create_release:
+        description: Create a GitHub release (manual runs otherwise only upload artifacts)
+        required: true
+        default: false
+        type: boolean
+      boot_test:
+        description: Boot every built image in QEMU and check the licence
+        required: true
+        default: true
+        type: boolean
+      legacy_bios:
+        description: Also build the x86 legacy-BIOS image
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+# A scheduled and a manual run must not patch the same version at once.
+concurrency:
+  group: routeros-release-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Resolve the version to build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      build: ${{ steps.resolve.outputs.build }}
+      release: ${{ steps.resolve.outputs.release }}
+    steps:
+      - name: Resolve the target version
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel || vars.ROUTEROS_CHANNEL || 'stable' }}
+          INPUT_VERSION: ${{ inputs.version }}
+          CREATE_RELEASE: ${{ inputs.create_release }}
+        run: |
+          set -euo pipefail
+
+          channel="$CHANNEL"
+          case "$channel" in
+            long-term|stable|testing|development) ;;
+            *) echo "::error::unknown release channel '$channel'"; exit 1 ;;
+          esac
+
+          manual=false
+          [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && manual=true
+
+          version="$INPUT_VERSION"
+          if [ -z "$version" ]; then
+            echo "checking the latest RouterOS version on the $channel channel"
+            body=$(curl -fsS --retry 3 --max-time 60 "https://upgrade.mikrotik.com/routeros/NEWESTa7.$channel")
+            version=$(printf '%s\n' "$body" | awk 'NR == 1 { print $1 }')
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?([a-z]+[0-9]+)?$ ]]; then
+            echo "::error::invalid RouterOS version '$version'"
+            exit 1
+          fi
+          echo "target version: $version (channel $channel)"
+
+          tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName \
+            --jq '.[].tagName' 2>/dev/null || true)
+          released=false
+          if printf '%s\n' "$tags" | grep -qx "v$version"; then released=true; fi
+          latest=$(printf '%s\n' "$tags" | sed -e 's/^v//' | grep -E '^[0-9]+\.' \
+            | sort -V | tail -n 1 || true)
+
+          build=false
+          release=false
+          if [ "$manual" = true ]; then
+            if [ "$CREATE_RELEASE" = true ]; then
+              if [ "$released" = true ]; then
+                echo "::notice::v$version already has a GitHub release; nothing to do"
+              else
+                build=true
+                release=true
+              fi
+            else
+              # Manual artifact build: patch whatever was asked for.
+              build=true
+            fi
+          elif [ "$released" = true ]; then
+            echo "v$version is already released"
+          else
+            newest="$version"
+            if [ -n "$latest" ]; then
+              newest=$(printf '%s\n%s\n' "$latest" "$version" | sort -V | tail -n 1)
+            fi
+            if [ "$newest" = "$version" ]; then
+              build=true
+              release=true
+            else
+              echo "::notice::upstream $version is older than the latest release v$latest; skipping"
+            fi
+          fi
+
+          {
+            echo "### RouterOS release check"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| channel | $channel |"
+            echo "| target version | $version |"
+            echo "| latest GitHub release | ${latest:-none} |"
+            echo "| released already | $released |"
+            echo "| build | $build |"
+            echo "| create release | $release |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "version=$version"
+            echo "build=$build"
+            echo "release=$release"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Patch and release RouterOS ${{ needs.check.outputs.version }}
+    if: ${{ needs.check.outputs.build == 'true' }}
+    needs: check
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-release.yml
+    with:
+      version: ${{ needs.check.outputs.version }}
+      release: ${{ needs.check.outputs.release == 'true' }}
+      boot_test: ${{ github.event_name == 'schedule' || inputs.boot_test }}
+      legacy_bios: ${{ github.event_name == 'schedule' || inputs.legacy_bios }}
+    secrets: inherit
