@@ -18,17 +18,24 @@ import (
 // downloadMu serialises the progress lines when several downloads run at once.
 var downloadMu sync.Mutex
 
+// userAgent identifies the client the way the RouterOS upgrade client does
+// ("User-Agent: RouterOS <version>", see docs/upgrade-api.md); build.Run sets
+// it to the version being fetched.
+var userAgent = "RouterOS"
+
 // downloadAttempts bounds the retries of a single transfer.  Every attempt
 // resumes the partial file, so a slow or interrupted download still finishes.
 const downloadAttempts = 6
 
 // downloadTransport keeps the package transfers on HTTP/1.1: the MikroTik CDN
 // is slow from some networks and occasionally cancels HTTP/2 streams
-// mid-transfer, which cannot be resumed.
+// mid-transfer, which cannot be resumed.  Compression is disabled like the
+// RouterOS client, so Range offsets always address the raw file.
 var downloadTransport = &http.Transport{
 	Proxy:                 http.ProxyFromEnvironment,
 	DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 	ForceAttemptHTTP2:     false,
+	DisableCompression:    true,
 	MaxIdleConns:          16,
 	IdleConnTimeout:       90 * time.Second,
 	TLSHandshakeTimeout:   30 * time.Second,
@@ -118,6 +125,7 @@ func fetchToFile(url, path, name string) error {
 	if err != nil {
 		return err
 	}
+	req.Header.Set("User-Agent", userAgent)
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
@@ -256,8 +264,13 @@ func fileSHA256(path string) (string, error) {
 
 // fetchString downloads a small text file and returns its contents.
 func fetchString(url string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", userAgent)
 	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Get(url)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}

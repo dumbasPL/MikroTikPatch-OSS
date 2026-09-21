@@ -164,6 +164,8 @@ func Run(opts Options) error {
 	cfg := &Config{Options: opts, RepoRoot: repo, Env: env, buildTime: buildTime}
 	cfg.initConcurrency()
 	patch.Logf = cfg.logf
+	// Identify as the RouterOS upgrade client to MikroTik's hosts.
+	userAgent = "RouterOS " + opts.Version
 	if !opts.SkipKeygen {
 		if err := cfg.buildKeygen(); err != nil {
 			return err

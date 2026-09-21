@@ -244,6 +244,36 @@ func TestDownloadRestartsWhenRangeIgnored(t *testing.T) {
 	}
 }
 
+// TestDownloadUserAgent covers the CDN-facing client identity: the RouterOS
+// upgrade client, and no Accept-Encoding like it (which would break Range
+// offsets).
+func TestDownloadUserAgent(t *testing.T) {
+	payload := []byte("routeros package")
+	var gotUA, gotEncoding string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		gotEncoding = r.Header.Get("Accept-Encoding")
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		w.Write(payload)
+	}))
+	defer srv.Close()
+
+	old := userAgent
+	userAgent = "RouterOS 7.24.4"
+	t.Cleanup(func() { userAgent = old })
+
+	dest := filepath.Join(t.TempDir(), "routeros.npk")
+	if err := download(srv.URL, dest); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if gotUA != "RouterOS 7.24.4" {
+		t.Errorf("User-Agent = %q, want %q", gotUA, "RouterOS 7.24.4")
+	}
+	if gotEncoding != "" {
+		t.Errorf("Accept-Encoding = %q, want none", gotEncoding)
+	}
+}
+
 // TestMoveFile covers the cross-device fallback: the default build dir is
 // /tmp (a tmpfs) and the publish dir usually lives on another filesystem.
 func TestMoveFile(t *testing.T) {
