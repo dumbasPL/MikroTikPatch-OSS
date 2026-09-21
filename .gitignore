@@ -1,0 +1,23 @@
+# Build outputs --------------------------------------------------------------
+/publish/
+/mikrotikpatch
+*.img
+*.img.zip
+
+# Binaries rebuilt by keygen/build.sh ----------------------------------------
+/keygen/keygen_x86
+/keygen/keygen_arm64
+/keygen/keygen_host
+
+# Local musl toolchain (tools/musl_i386.sh) ----------------------------------
+/.toolchain/
+
+# Local key material (mikrotikpatch genkeys) ---------------------------------
+keys.env
+
+# Local agent / tool config ---------------------------------------------------
+opencode.json
+
+# Scratch ---------------------------------------------------------------------
+__pycache__/
+*.pyc
