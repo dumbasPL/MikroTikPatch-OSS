@@ -46,8 +46,6 @@ Requirements:
 ./mikrotikpatch patch-v7 --version 7.24.4 --archs all --boot-test --legacy-bios
 ```
 
-Artifacts land in `publish/<version>/`:
-
 ## patch-v7 options
 
 ```
