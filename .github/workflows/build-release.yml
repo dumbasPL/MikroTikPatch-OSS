@@ -161,11 +161,8 @@ jobs:
           set -euo pipefail
           {
             echo "Patched RouterOS $VERSION build."
-            echo
-            echo "- Upstream packages: https://download.mikrotik.com/routeros/$VERSION/"
-            echo "- Source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA"
             echo "- Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            echo
+            echo ""
             cat "publish/$VERSION/CHANGELOG"
           } > "$RUNNER_TEMP/release-notes.md"
 
