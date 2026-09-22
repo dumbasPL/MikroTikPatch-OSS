@@ -1,8 +1,19 @@
 # MikroTikPatch
 
-Patch RouterOS v7 packages to a custom licence/NPK key set and build bootable
-CHR disk images. Everything is built in: no root privileges and no external
-tools for downloads, ISO and squashfs handling, filesystems or zip files.
+Patch RouterOS v7 CHR images with custom keys.
+
+## Differences vs [elseif/MikroTikPatch](https://github.com/elseif/MikroTikPatch)
+
+- Fully open source, no pre-compiled binaries, no password protected ZIPs, etc.
+- Possible to run locally (because everything is open source)
+- No shell access (massive security hole IMO)
+- Physical Reboot required to activate feature flags (another massive security hole IMO)
+- No third party cloud connectivity (because who knows what's running there. Manual updates still work)
+
+Why am I not publishing keys? So that in the rare case you trust me (and github actions),
+you can still have a relatively secure system with minimal effort.
+If you don't tryst me, it's very easy to generate your own keys and builds.
+There is no benefit in releasing the keys, the keygen already runs automatically.
 
 ## Build
 
@@ -37,15 +48,6 @@ Requirements:
 
 Artifacts land in `publish/<version>/`:
 
-```
-routeros-<version>[-<arch>].npk   patched main package
-<component>-<version>[-<arch>].npk  re-signed component packages
-all_packages-<arch>-<version>.zip   all components of one architecture
-chr-<version>[-<arch>][-legacy-bios].img.zip   CHR disk images
-```
-
-Architectures, component signing, downloads and boot tests run in parallel.
-
 ## patch-v7 options
 
 ```
@@ -62,43 +64,20 @@ Architectures, component signing, downloads and boot tests run in parallel.
 --jobs <n>                 parallel CPU workers (default min(NumCPU,8))
 ```
 
-## Other commands
-
-```sh
-./mikrotikpatch genkeys [--out keys.env]
-```
-
 ## Automated releases
-
-`.github/workflows/check-release.yml` runs hourly and on demand. On a schedule
-it asks `upgrade.mikrotik.com` for the newest RouterOS version on the release
-channel and compares it with the releases in this repository. When the version
-is new (and no release tagged `v<version>` exists yet) it calls
-`.github/workflows/build-release.yml`, which patches both architectures,
-boot-tests the CHR images in QEMU and publishes a release: the body contains
-the upstream changelog and the assets are the CHR images
-(`chr-*.img.zip`), the main packages
-(`routeros-<version>[-<arch>].npk`) and the package archives
-(`all_packages-<arch>-<version>.zip`). Beta and rc versions are marked as
-pre-releases.
-
-Manual runs (**Actions → Check for new RouterOS releases → Run workflow**)
-build the latest or a specific version and upload the result as workflow
-artifacts; tick `create_release` to publish a release instead. Every image is
-boot tested before it is published (`boot_test`, on by default; hosted runners
-have no KVM, so the emulated boot tests are slow). The same inputs are
-available when running **Build patched RouterOS release** directly.
 
 One-time setup:
 
-1. Generate the key set and keep it forever:
-   `./mikrotikpatch genkeys --out keys.env`
-2. Store the complete contents of `keys.env` in a repository secret named
-   `KEYS_ENV` (the build refuses to run without it). Every patched device
-   trusts these keys, so regenerating them invalidates all previous releases.
-3. Optional: set the repository variable `ROUTEROS_CHANNEL` to `long-term`,
+1. Fork the repo, enable actions.
+2. Generate the key set and keep it forever: `./mikrotikpatch genkeys --out keys.env`
+3. Store the complete contents of `keys.env` in a repository secret named `KEYS_ENV`.
+4. Optional: set the repository variable `ROUTEROS_CHANNEL` to `long-term`,
    `testing` or `development` to change the channel the hourly check uses
    (default `stable`).
 
-GitHub disables scheduled workflows after 60 days without repository activity;
-re-enable the schedule from the Actions tab if that happens.
+## AI disclosure
+
+This whole thing has been reverse engineered and re-written by DeepSeek V4.1 Flash.
+While I do know what I'm doing, and could do this myself, I don't have this much free time for a side project made only because I hate fake "open source" projects.
+While reverse engineering the original MikroTikPatch I didn't find any evidence of a backdoor, but I would still rather use this 
+truly open slop than trust the random chinese dude won't add anything extra to the encrypted zip in the future.
