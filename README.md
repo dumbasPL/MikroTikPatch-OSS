@@ -12,7 +12,7 @@ Patch RouterOS v7 CHR images with custom keys.
 
 Why am I not publishing keys? So that in the rare case you trust me (and github actions),
 you can still have a relatively secure system with minimal effort.
-If you don't tryst me, it's very easy to generate your own keys and builds.
+If you don't trust me, it's very easy to generate your own keys and builds.
 There is no benefit in releasing the keys, the keygen already runs automatically.
 
 ## Build
