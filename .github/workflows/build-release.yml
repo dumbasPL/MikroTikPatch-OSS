@@ -153,6 +153,25 @@ jobs:
           if [ "$BOOT_TEST" = "true" ]; then args+=(--boot-test --boot-test-timeout 1800); fi
           ./mikrotikpatch "${args[@]}"
 
+      # List the checksums in the job summary so a downloaded asset can be
+      # verified independently of the transfer.
+      - name: Write the SHA-256 sums to the job summary
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### SHA-256 sums of the release files"
+            echo
+            echo '```'
+            (cd "publish/$VERSION" && sha256sum \
+              routeros-*.npk all_packages-*.zip chr-*.img.zip)
+            echo '```'
+            echo
+            echo 'The block can be saved and checked with: sha256sum -c <file>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Assemble the release notes
         shell: bash
         env:
