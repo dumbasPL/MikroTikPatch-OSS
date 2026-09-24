@@ -18,6 +18,7 @@
 package keygen
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -242,6 +243,22 @@ func KeymanSoftwareID() string {
 		}
 	}
 	return strings.TrimSpace(last)
+}
+
+// StoredLicenceValid reports whether the 64-byte stored licence already is a
+// valid signature for licval under the custom public key, using the device's
+// odd-root convention.  The mode role keeps such a licence instead of
+// re-signing it on every boot: RouterOS treats a rewritten licence as a new
+// software key and reboots to activate it.
+func StoredLicenceValid(stored, licval []byte) bool {
+	if len(stored) < 64 || len(licval) != 16 {
+		return false
+	}
+	if !bytes.Equal(mikro.MTTransform(stored[:16]), licval) {
+		return false
+	}
+	pub := mikro.LEBytes(CustomPublicKeyX(), 32)
+	return mikro.KCDSAVerifyDevice(licval, stored[16:64], pub)
 }
 
 // SignLicVal returns MT_Transform_Rev(licval) followed by the 48-byte

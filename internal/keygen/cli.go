@@ -61,13 +61,18 @@ func RunGenerate(stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	decoded, err := SignLicVal(licval)
-	if err != nil {
-		return err
-	}
-	copy(cfg[OffLic:OffLic+64], decoded)
-	if err := WriteConfig(cfg); err != nil {
-		return err
+	if StoredLicenceValid(cfg[OffLic:OffLic+64], licval) {
+		// keep the installed licence: re-signing it on every boot makes
+		// RouterOS treat it as a new software key and reboot to activate it
+	} else {
+		decoded, err := SignLicVal(licval)
+		if err != nil {
+			return err
+		}
+		copy(cfg[OffLic:OffLic+64], decoded)
+		if err := WriteConfig(cfg); err != nil {
+			return err
+		}
 	}
 	licText, err := MakeLicense(licval)
 	if err != nil {

@@ -855,6 +855,22 @@ static int kcdsa_verify(const u8 licval[16], const u8 sig[48],
     return 0;
 }
 
+/* True when the 64-byte stored licence already is a valid signature for
+ * licval.  The mode role uses this to keep an installed licence instead of
+ * re-signing it on every boot: RouterOS treats a rewritten licence as a new
+ * software key and reboots to activate it, so regenerating it each boot puts
+ * the device into a reboot loop. */
+static int stored_licence_valid(const u8 stored[64], const u8 licval[16]) {
+    u8 derived[16];
+    u256 pubx;
+
+    mt_transform(derived, stored);
+    if (memcmp(derived, licval, sizeof(derived)) != 0)
+        return 0;
+    load_public_x(&pubx);
+    return kcdsa_verify(licval, stored + 16, &pubx, 1);
+}
+
 /* ------------------------------------------------------------------------- */
 /* 10. Licence-value derivation for the two modes                            */
 /* ------------------------------------------------------------------------- */
@@ -1168,12 +1184,14 @@ static void run_generate(void) {
     }
 
     load_private_key(&d);
-    {
+    if (stored_licence_valid(cfg + OFF_LIC, licval)) {
+        /* keep the installed licence (see stored_licence_valid) */
+    } else {
         u8 decoded[64];
         sign_licval(decoded, licval, &d);
         memcpy(cfg + OFF_LIC, decoded, sizeof(decoded));
+        write_config(cfg, cfg_len);
     }
-    write_config(cfg, cfg_len);
     print_license(system_id, licval, &d);
     free(cfg);
 }
