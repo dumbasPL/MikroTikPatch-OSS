@@ -59,10 +59,16 @@ func TestParseAndExtract(t *testing.T) {
 	if bash == nil {
 		t.Log("note: no bin/bash in this package")
 	}
-	// File container round trip.
+	// File container round trip: the serialised stream must be byte-identical
+	// (the stock tooling uses zlib level 0 with 32 KiB stored blocks, and the
+	// parser must not shift any metadata field).
 	raw, err := fc.Serialize()
 	if err != nil {
 		t.Fatal(err)
+	}
+	orig := pkg.Get(PartFileContainer).Bytes()
+	if !bytes.Equal(raw, orig) {
+		t.Fatalf("container round trip changed the bytes (%d -> %d)", len(orig), len(raw))
 	}
 	fc2, err := UnserializeFileContainer(raw)
 	if err != nil {
@@ -75,6 +81,13 @@ func TestParseAndExtract(t *testing.T) {
 		a, b := fc.Items[i], fc2.Items[i]
 		if string(a.Name) != string(b.Name) || !bytes.Equal(a.Data, b.Data) || a.Perm != b.Perm || a.Type != b.Type {
 			t.Fatalf("item %d differs after round trip", i)
+		}
+		// The metadata must survive the round trip (a field-offset bug here
+		// used to mangle ModifyTime/Revision/... on re-serialisation).
+		if a.ModifyTime != b.ModifyTime || a.Revision != b.Revision || a.RC != b.RC ||
+			a.Minor != b.Minor || a.Major != b.Major || a.CreateTime != b.CreateTime ||
+			a.Unknown != b.Unknown || a.UsrOrGrp != b.UsrOrGrp {
+			t.Fatalf("item %d metadata differs after round trip: %+v vs %+v", i, a, b)
 		}
 	}
 }

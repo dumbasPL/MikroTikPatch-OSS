@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"hash/adler32"
 	"io"
 	"os"
 	"strconv"
@@ -605,24 +606,41 @@ func packFileItem(item *FileItem) []byte {
 	return out
 }
 
-// Serialize zlib-compresses (level 0, like the stock tooling) the records.
+// Serialize stores the records in a zlib stream (level 0) the way the stock
+// tooling does: 32 KiB uncompressed deflate blocks.
 func (fc *FileContainer) Serialize() ([]byte, error) {
 	var raw bytes.Buffer
 	for _, item := range fc.Items {
 		raw.Write(packFileItem(item))
 	}
-	var out bytes.Buffer
-	zw, err := zlib.NewWriterLevel(&out, zlib.NoCompression)
-	if err != nil {
-		return nil, err
+	return storedZlib(raw.Bytes()), nil
+}
+
+// storedZlib encodes data as a zlib stream of stored (uncompressed) deflate
+// blocks of blockSize bytes, matching zlib level 0 with the stock block size.
+func storedZlib(data []byte) []byte {
+	const blockSize = 32768
+	out := make([]byte, 0, len(data)+len(data)/blockSize*5+16)
+	out = append(out, 0x78, 0x01) // CMF/FLG: deflate, 32 KiB window, no dict
+	if len(data) == 0 {
+		out = append(out, 0x01, 0x00, 0x00, 0xff, 0xff)
+	} else {
+		for off := 0; off < len(data); off += blockSize {
+			n := blockSize
+			if off+n > len(data) {
+				n = len(data) - off
+			}
+			final := byte(0)
+			if off+n == len(data) {
+				final = 1
+			}
+			out = append(out, final, byte(n), byte(n>>8), byte(^uint16(n)), byte(^uint16(n)>>8))
+			out = append(out, data[off:off+n]...)
+		}
 	}
-	if _, err := zw.Write(raw.Bytes()); err != nil {
-		return nil, err
-	}
-	if err := zw.Close(); err != nil {
-		return nil, err
-	}
-	return out.Bytes(), nil
+	sum := adler32.Checksum(data)
+	out = append(out, byte(sum>>24), byte(sum>>16), byte(sum>>8), byte(sum))
+	return out
 }
 
 // UnserializeFileContainer parses a FILE_CONTAINER payload.
@@ -652,13 +670,13 @@ func UnserializeFileContainer(data []byte) (*FileContainer, error) {
 		item := &FileItem{
 			Perm:       h[0],
 			Type:       h[1],
-			ModifyTime: binary.LittleEndian.Uint32(h[4:]),
-			Revision:   h[8],
-			RC:         h[9],
-			Minor:      h[10],
-			Major:      h[11],
-			CreateTime: binary.LittleEndian.Uint32(h[12:]),
-			Unknown:    binary.LittleEndian.Uint32(h[16:]),
+			ModifyTime: binary.LittleEndian.Uint32(h[8:]),
+			Revision:   h[12],
+			RC:         h[13],
+			Minor:      h[14],
+			Major:      h[15],
+			CreateTime: binary.LittleEndian.Uint32(h[16:]),
+			Unknown:    binary.LittleEndian.Uint32(h[20:]),
 			Name:       append([]byte(nil), raw[offset:offset+nameSize]...),
 		}
 		copy(item.UsrOrGrp[:], h[2:8])
