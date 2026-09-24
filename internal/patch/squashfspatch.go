@@ -136,10 +136,39 @@ func childFile(dir *squashfs.Node, name string) *squashfs.Node {
 	return nil
 }
 
+// patchLicenceBinaries replaces the licence public key (and the service hosts)
+// in every binary that verifies licences in one directory: mode, keyman and,
+// when present, mode2 (the stock licence manager the keygen hands over to).
+//
+// loader is deliberately left untouched: RouterOS validates the loader's
+// embedded key against other state at boot (the recovered reference tool
+// patches mode2 at runtime through a loader stub instead), so re-signing it
+// makes the system supervisor (/nova/bin/sys2) abort and the boot loops.
+func patchLicenceBinaries(dir *squashfs.Node, keys []KeyPair, arch, path string, replacements map[string]string) error {
+	for _, filename := range []string{"mode", "keyman", "mode2"} {
+		file := childFile(dir, filename)
+		if file == nil {
+			continue
+		}
+		data := ReplaceStrings(file.Data, replacements, path+"/"+filename)
+		patched := data
+		for i, k := range keys {
+			before := patched
+			patched = ReplaceKeyArch(k.Old, k.New, patched, path+"/"+filename, arch)
+			if i == 0 && bytes.Equal(before, patched) {
+				return fmt.Errorf("%s/%s: licence public key not patched", path, filename)
+			}
+		}
+		file.Data = patched
+	}
+	return nil
+}
+
 // PatchSquashfs patches keys and bootstrap URLs in an extracted squashfs tree.
-// "mode"/"keyman" carry the licence key material and get the keygen installed
-// next to them; every other file is scanned for the stock keys and hosts.
-// arch is the RouterOS architecture (ARCH-style).
+// The licence verifiers (mode, keyman, mode2) carry the licence key material
+// and get the keygen installed next to them; loader is left stock and every
+// other file is scanned for the stock keys and hosts.  arch is the RouterOS
+// architecture (ARCH-style).
 func PatchSquashfs(root *squashfs.Node, keys []KeyPair, arch string) error {
 	replacements, err := ServiceReplacements()
 	if err != nil {
@@ -149,13 +178,8 @@ func PatchSquashfs(root *squashfs.Node, keys []KeyPair, arch string) error {
 	walk = func(dir *squashfs.Node, path string) error {
 		has := func(name string) bool { return childFile(dir, name) != nil }
 		if has("mode") && has("keyman") {
-			for _, filename := range []string{"mode", "keyman"} {
-				file := childFile(dir, filename)
-				data := ReplaceStrings(file.Data, replacements, path+"/"+filename)
-				for _, k := range keys {
-					data = ReplaceKeyArch(k.Old, k.New, data, path+"/"+filename, arch)
-				}
-				file.Data = data
+			if err := patchLicenceBinaries(dir, keys, arch, path, replacements); err != nil {
+				return err
 			}
 			if err := InstallMode(dir, arch); err != nil {
 				return err
@@ -176,7 +200,7 @@ func PatchSquashfs(root *squashfs.Node, keys []KeyPair, arch string) error {
 				continue
 			}
 			switch c.Name {
-			case "mode", "keyman", "loader", "BOOTX64.EFI":
+			case "mode", "keyman", "mode2", "loader", "BOOTX64.EFI":
 				continue
 			}
 			filePath := path + "/" + c.Name

@@ -6,7 +6,55 @@ import (
 	"testing"
 
 	"mikrotikpatch/internal/lzma"
+	"mikrotikpatch/internal/squashfs"
 )
+
+// TestPatchLicenceBinariesLoader covers the x86-mode boot gate: mode2 is the
+// stock licence manager the keygen hands over to, so it must get the custom
+// key like mode and keyman, while loader must stay stock (re-signing it makes
+// sys2 abort and the boot loop).
+func TestPatchLicenceBinariesLoader(t *testing.T) {
+	old := make([]byte, 32)
+	newKey := make([]byte, 32)
+	for i := range old {
+		old[i] = byte(i)
+		newKey[i] = byte(0x80 + i)
+	}
+	dir := &squashfs.Node{Name: "bin", Type: squashfs.TypeDir}
+	for _, name := range []string{"mode", "keyman", "mode2", "loader"} {
+		dir.Children = append(dir.Children, &squashfs.Node{
+			Name: name,
+			Type: squashfs.TypeFile,
+			Data: append([]byte("blob"), old...),
+		})
+	}
+	keys := []KeyPair{{Old: old, New: newKey}}
+	if err := patchLicenceBinaries(dir, keys, "x86", "/nova/bin", nil); err != nil {
+		t.Fatalf("patchLicenceBinaries: %v", err)
+	}
+	for _, c := range dir.Children {
+		patched := bytes.Contains(c.Data, newKey) && !bytes.Contains(c.Data, old)
+		if c.Name == "loader" {
+			if patched {
+				t.Error("loader must not be re-signed")
+			}
+			continue
+		}
+		if !patched {
+			t.Errorf("%s was not patched", c.Name)
+		}
+	}
+
+	// A verifier without the stock key must fail the build instead of
+	// shipping an unpatched binary.
+	bad := &squashfs.Node{Name: "bin", Type: squashfs.TypeDir, Children: []*squashfs.Node{
+		{Name: "mode", Type: squashfs.TypeFile, Data: []byte("no key here")},
+		{Name: "keyman", Type: squashfs.TypeFile, Data: []byte("no key here")},
+	}}
+	if err := patchLicenceBinaries(bad, keys, "x86", "/nova/bin", nil); err == nil {
+		t.Fatal("a verifier without the stock key did not fail")
+	}
+}
 
 func TestArmLoadImm(t *testing.T) {
 	// Value 0xCFBB40A6 must load as MOVW r3,#0x40A6 / MOVT r3,#0xCFBB / NOP.
