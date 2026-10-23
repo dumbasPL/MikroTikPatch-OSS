@@ -14,40 +14,6 @@ import (
 // Logf reports progress; it can be replaced by the CLI.
 var Logf = func(format string, args ...any) { fmt.Printf(format, args...) }
 
-// ArmLoadImm builds the three ARMv7 instructions that load a 32-bit immediate
-// into rd.
-//
-// The stock ARM binaries do not store the licence key word verbatim: they
-// rebuild it from a table entry plus a hard-coded delta.  For a new key the
-// delta does not fit, so the word is loaded directly instead.
-//
-// style "movt": MOVW/MOVT/NOP (32-bit key table, word = bytes 12..16).
-// style "orr":  MOVW/ORR/ORR (packed key table, word 8).
-func ArmLoadImm(rd uint32, value uint32, style string) [][]byte {
-	lo := value & 0xffff
-	movw := uint32(0xE3000000) | ((lo & 0xf000) << 4) | (rd << 12) | (lo & 0xfff)
-	var words [3]uint32
-	if style == "orr" {
-		b2 := (value >> 16) & 0xff
-		b3 := (value >> 24) & 0xff
-		words[0] = movw
-		words[1] = 0xE3800000 | (rd << 16) | (rd << 12) | (8 << 8) | b2
-		words[2] = 0xE3800000 | (rd << 16) | (rd << 12) | (4 << 8) | b3
-	} else {
-		hi := (value >> 16) & 0xffff
-		words[0] = movw
-		words[1] = 0xE3400000 | ((hi & 0xf000) << 4) | (rd << 12) | (hi & 0xfff)
-		words[2] = 0xE1A00000 // NOP
-	}
-	out := make([][]byte, 3)
-	for i, w := range words {
-		b := make([]byte, 4)
-		binary.LittleEndian.PutUint32(b, w)
-		out[i] = b
-	}
-	return out
-}
-
 // ReplaceChunks replaces every occurrence of the old chunk sequence with the
 // new one, allowing up to six bytes between consecutive chunks.  The gap bytes
 // are preserved, and (like Python's greedy regex) the largest gap that still
@@ -192,6 +158,399 @@ func ReplaceChunksUnordered(oldChunks, newChunks [][]byte, data []byte, name str
 	return out
 }
 
+// armTableSpan bounds the span of a literal pool that stores the words of one
+// ARM key representation.  Compilers keep the words contiguous; the slack
+// tolerates alignment padding and a few interleaved constants.
+const armTableSpan = 128
+
+// armWordTable is one way RouterOS materialises the ARM public key: a literal
+// pool with most of the words and, usually, an instruction sequence that
+// derives the remaining word.
+type armWordTable struct {
+	oldWords [][]byte
+	newWords [][]byte
+	stored   []int // word indices present in the literal pool
+	derived  int   // word index computed by instructions, or -1
+}
+
+// armPatch is one in-place replacement.
+type armPatch struct {
+	off  int
+	data []byte
+}
+
+// replaceArmKey patches every ARM key table in data.  Both known encodings are
+// tried: the full-word table used by the arm32 userspace (seven words stored,
+// the fourth derived) and the bit-packed table (nine words stored, the ninth
+// derived).  The stored words are matched as a set, in any order, and the
+// table is only patched when the derived word can be rewritten too.
+func replaceArmKey(old, new []byte, data []byte, name string) []byte {
+	tables := []armWordTable{
+		{oldWords: chunk4(old), newWords: chunk4(new),
+			stored: []int{4, 5, 2, 0, 1, 6, 7}, derived: 3},
+		{oldWords: packedWords(old), newWords: packedWords(new),
+			stored: []int{0, 1, 2, 3, 4, 5, 6, 7, 9}, derived: 8},
+	}
+	for {
+		patched := false
+		for _, t := range tables {
+			out, ok := replaceArmTable(data, t, name)
+			if ok {
+				data = out
+				patched = true
+				break
+			}
+		}
+		if !patched {
+			return data
+		}
+	}
+}
+
+// replaceArmTable patches one key table.  If the table happens to contain all
+// eight (or ten) words, no instruction rewrite is needed.  Otherwise the
+// stored words are patched and the derived word's instruction sequence is
+// rewritten atomically: a table match with no usable derived-word patch does
+// not change data at all.
+func replaceArmTable(data []byte, t armWordTable, name string) ([]byte, bool) {
+	all := append([]int(nil), t.stored...)
+	if t.derived >= 0 {
+		all = append(all, t.derived)
+	}
+	if out, ok := patchArmWordSet(data, t.oldWords, t.newWords, all, name); ok {
+		return out, true
+	}
+	if t.derived < 0 {
+		return data, false
+	}
+
+	chunks := make([][]byte, len(t.stored))
+	for i, idx := range t.stored {
+		chunks[i] = t.oldWords[idx]
+	}
+	offsets, ok := findChunkSet(data, chunks, armTableSpan)
+	if !ok {
+		return data, false
+	}
+	wordOffsets := make(map[int]int, len(t.stored))
+	for i, idx := range t.stored {
+		wordOffsets[idx] = offsets[i]
+	}
+	derivedPatches, ok := patchArmDerived(data, t.oldWords, t.newWords, t.derived, wordOffsets)
+	if !ok {
+		return data, false
+	}
+
+	out := append([]byte(nil), data...)
+	for i, idx := range t.stored {
+		copy(out[offsets[i]:], t.newWords[idx])
+	}
+	for _, p := range derivedPatches {
+		copy(out[p.off:], p.data)
+	}
+	Logf("%s public key patched %X...\n", name, t.oldWords[0])
+	return out, true
+}
+
+// patchArmWordSet finds a window holding every word in indices, in any order,
+// and replaces each with the corresponding new word.
+func patchArmWordSet(data []byte, oldWords, newWords [][]byte, indices []int, name string) ([]byte, bool) {
+	chunks := make([][]byte, len(indices))
+	for i, idx := range indices {
+		chunks[i] = oldWords[idx]
+	}
+	offsets, ok := findChunkSet(data, chunks, armTableSpan)
+	if !ok {
+		return data, false
+	}
+	out := append([]byte(nil), data...)
+	for i, idx := range indices {
+		copy(out[offsets[i]:], newWords[idx])
+	}
+	Logf("%s public key patched %X...\n", name, oldWords[0])
+	return out, true
+}
+
+// findChunkSet finds one window in data that contains all chunks exactly once,
+// in any order, with the whole set spanning at most span bytes.  It anchors on
+// the first chunk and searches the window around each of its occurrences.
+func findChunkSet(data []byte, chunks [][]byte, span int) ([]int, bool) {
+	if len(chunks) == 0 || span <= 0 {
+		return nil, false
+	}
+	for pos := 0; ; {
+		j := bytes.Index(data[pos:], chunks[0])
+		if j < 0 {
+			return nil, false
+		}
+		anchor := pos + j
+		lo := anchor - span
+		if lo < 0 {
+			lo = 0
+		}
+		hi := anchor + span + len(chunks[0])
+		if hi > len(data) {
+			hi = len(data)
+		}
+		offsets := make([]int, len(chunks))
+		offsets[0] = anchor
+		complete := true
+		for i := 1; i < len(chunks); i++ {
+			k := bytes.Index(data[lo:hi], chunks[i])
+			if k < 0 {
+				complete = false
+				break
+			}
+			offsets[i] = lo + k
+		}
+		if complete {
+			first, last := offsets[0], offsets[0]
+			for _, off := range offsets[1:] {
+				if off < first {
+					first = off
+				}
+				if off > last {
+					last = off
+				}
+			}
+			if last+4-first <= span {
+				return offsets, true
+			}
+		}
+		pos = anchor + 1
+	}
+}
+
+// armInsn is one 32-bit ARM instruction with its file offset.
+type armInsn struct {
+	off  int
+	word uint32
+}
+
+func armRor(v uint32, shift uint32) uint32 {
+	shift &= 31
+	if shift == 0 {
+		return v
+	}
+	return v>>shift | v<<(32-shift)
+}
+
+// armAddSub decodes ADD/SUB <Rd>, <Rd>, #imm.  It only accepts the
+// unconditional, flag-preserving form the compilers use for key arithmetic.
+func armAddSub(w uint32) (reg int, imm uint32, sub, ok bool) {
+	if w>>28 != 0xE || w&0x0E000000 != 0x02000000 || w&(1<<20) != 0 {
+		return 0, 0, false, false
+	}
+	op := (w >> 21) & 0xf
+	if op != 2 && op != 4 {
+		return 0, 0, false, false
+	}
+	rd := int((w >> 12) & 0xf)
+	if int((w>>16)&0xf) != rd {
+		return 0, 0, false, false
+	}
+	return rd, armRor(w&0xff, 2*((w>>8)&0xf)), op == 2, true
+}
+
+func armMovw(w uint32) (reg int, imm uint16, ok bool) {
+	if w>>28 != 0xE || w&0x0ff00000 != 0x03000000 {
+		return 0, 0, false
+	}
+	return int((w >> 12) & 0xf), uint16((w>>16)&0xf)<<12 | uint16(w&0xfff), true
+}
+
+func armMovt(w uint32) (reg int, imm uint16, ok bool) {
+	if w>>28 != 0xE || w&0x0ff00000 != 0x03400000 {
+		return 0, 0, false
+	}
+	return int((w >> 12) & 0xf), uint16((w>>16)&0xf)<<12 | uint16(w&0xfff), true
+}
+
+// armLdrLiteral decodes LDR <Rd>, [pc, #imm].
+func armLdrLiteral(w uint32, off int) (reg, target int, ok bool) {
+	if w>>28 != 0xE || w&0x0f7f0000 != 0x051f0000 {
+		return 0, 0, false
+	}
+	imm := int(w & 0xfff)
+	if w&(1<<23) == 0 {
+		imm = -imm
+	}
+	return int((w >> 12) & 0xf), off + 8 + imm, true
+}
+
+// armStrSp reports whether w is STR <Rd>, [sp, #imm].
+func armStrSp(w uint32) (reg int, ok bool) {
+	if w>>28 != 0xE || (w&0x0ff00000 != 0x05800000 && w&0x0ff00000 != 0x05000000) {
+		return 0, false
+	}
+	if (w>>16)&0xf != 13 {
+		return 0, false
+	}
+	return int((w >> 12) & 0xf), true
+}
+
+func armMovwInsn(reg int, imm uint16) []byte {
+	w := uint32(0xE3000000) | uint32((imm>>12)&0xf)<<16 | uint32(reg)<<12 | uint32(imm&0xfff)
+	return armWord(w)
+}
+
+func armMovtInsn(reg int, imm uint16) []byte {
+	w := uint32(0xE3400000) | uint32((imm>>12)&0xf)<<16 | uint32(reg)<<12 | uint32(imm&0xfff)
+	return armWord(w)
+}
+
+func armNop() []byte { return armWord(0xE1A00000) }
+
+func armWord(w uint32) []byte {
+	b := make([]byte, 4)
+	binary.LittleEndian.PutUint32(b, w)
+	return b
+}
+
+// patchArmDerived finds the instructions that compute the word missing from the
+// literal pool and rewrites them to load newWords[derived] directly.  It
+// accepts either a MOVW/MOVT pair or a chain of ADD/SUB immediates on one
+// register that starts from one of the stored words.
+func patchArmDerived(data []byte, oldWords, newWords [][]byte, derived int, wordOffsets map[int]int) ([]armPatch, bool) {
+	oldWord := binary.LittleEndian.Uint32(oldWords[derived])
+	newWord := binary.LittleEndian.Uint32(newWords[derived])
+
+	minOff, maxOff := len(data), 0
+	for _, off := range wordOffsets {
+		if off < minOff {
+			minOff = off
+		}
+		if off+4 > maxOff {
+			maxOff = off + 4
+		}
+	}
+	start := minOff - 512
+	if start < 0 {
+		start = 0
+	}
+	start &^= 3
+	end := maxOff + 256
+	if end > len(data) {
+		end = len(data)
+	}
+
+	var insns []armInsn
+	for off := start; off+4 <= end; off += 4 {
+		// Do not decode the literal pool itself as instructions.
+		if off >= minOff && off < maxOff {
+			continue
+		}
+		insns = append(insns, armInsn{off: off, word: binary.LittleEndian.Uint32(data[off:])})
+	}
+
+	// A compiler that materialises the missing word with MOVW/MOVT needs no
+	// arithmetic at all.
+	for i := 0; i+1 < len(insns); i++ {
+		reg, lo, ok := armMovw(insns[i].word)
+		if !ok || uint32(lo) != oldWord&0xffff {
+			continue
+		}
+		reg2, hi, ok := armMovt(insns[i+1].word)
+		if !ok || reg2 != reg || uint32(hi) != oldWord>>16 {
+			continue
+		}
+		return []armPatch{
+			{insns[i].off, armMovwInsn(reg, uint16(newWord))},
+			{insns[i+1].off, armMovtInsn(reg, uint16(newWord>>16))},
+		}, true
+	}
+
+	type step struct {
+		off int
+		imm uint32
+		sub bool
+	}
+	var chains [16][]step
+	for _, in := range insns {
+		if reg, imm, sub, ok := armAddSub(in.word); ok {
+			chains[reg] = append(chains[reg], step{off: in.off, imm: imm, sub: sub})
+		}
+	}
+	for reg := 0; reg < 16; reg++ {
+		steps := chains[reg]
+		for i := 0; i+1 < len(steps); i++ {
+			var delta uint32
+			for j := i; j < len(steps) && j < i+4; j++ {
+				if steps[j].sub {
+					delta -= steps[j].imm
+				} else {
+					delta += steps[j].imm
+				}
+				if j == i {
+					continue
+				}
+				for base, baseOff := range wordOffsets {
+					baseWord := binary.LittleEndian.Uint32(oldWords[base])
+					if baseWord+delta != oldWord {
+						continue
+					}
+					if !armChainMatches(insns, reg, baseOff, steps[i].off, steps[j].off) {
+						continue
+					}
+					patches := []armPatch{
+						{steps[i].off, armMovwInsn(reg, uint16(newWord))},
+						{steps[i+1].off, armMovtInsn(reg, uint16(newWord>>16))},
+					}
+					for k := i + 2; k <= j; k++ {
+						patches = append(patches, armPatch{steps[k].off, armNop()})
+					}
+					return patches, true
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
+// armChainMatches checks that the chain around chainStart/chainEnd starts from
+// the stored word at baseOff and that its result is written to the stack right
+// after the chain.  That ties the arithmetic to the key table instead of
+// accepting any add sequence that happens to produce the old word.
+func armChainMatches(insns []armInsn, reg, baseOff, chainStart, chainEnd int) bool {
+	loaded := false
+	for _, in := range insns {
+		if in.off >= chainStart || in.off < chainStart-128 {
+			continue
+		}
+		if r, target, ok := armLdrLiteral(in.word, in.off); ok && r == reg && target == baseOff {
+			loaded = true
+		}
+	}
+	if !loaded {
+		return false
+	}
+
+	storeOff := -1
+	for _, in := range insns {
+		if in.off <= chainEnd || in.off > chainEnd+64 {
+			continue
+		}
+		if r, ok := armStrSp(in.word); ok && r == reg {
+			storeOff = in.off
+			break
+		}
+	}
+	if storeOff < 0 {
+		return false
+	}
+	// The chain must contain every ADD/SUB to this register up to the store;
+	// otherwise the last steps would still change the value we just loaded.
+	for _, in := range insns {
+		if in.off <= chainEnd || in.off >= storeOff {
+			continue
+		}
+		if r, _, _, ok := armAddSub(in.word); ok && r == reg {
+			return false
+		}
+	}
+	return true
+}
+
 // keyMap is the byte order of the packed key table.
 var keyMap = []int{28, 19, 25, 16, 14, 3, 24, 15, 22, 8, 6, 17, 11, 7, 9, 23,
 	18, 13, 10, 0, 26, 21, 2, 5, 20, 30, 31, 4, 27, 29, 1, 12}
@@ -200,8 +559,10 @@ var keyMap = []int{28, 19, 25, 16, 14, 3, 24, 15, 22, 8, 6, 17, 11, 7, 9, 23,
 // one.  archEnv selects the ARM handling and is ARCH-style ("x86", "arm64");
 // anything else gets the byte-level replacements only.
 //
-// ARM binaries additionally rebuild part of the licence key from hard-coded
-// instructions, which are rewritten to load the new key directly.
+// ARM binaries store most of the key in a literal pool and derive the
+// remaining word with compiler-generated instructions.  replaceArmKey matches
+// the stored words as a set and rewrites the derivation, so both the pool
+// order and the instruction encoding may change between RouterOS builds.
 func ReplaceKeyArch(old, new []byte, data []byte, name, archEnv string) []byte {
 	oldChunks := chunk4(old)
 	newChunks := chunk4(new)
@@ -225,35 +586,7 @@ func ReplaceKeyArch(old, new []byte, data []byte, name, archEnv string) []byte {
 	if arch != "arm" && arch != "arm64" {
 		return data
 	}
-	// Full-word key table: the stock word order differs from the byte order.
-	oldBytes := concat(oldChunks[4], oldChunks[5], oldChunks[2], oldChunks[0], oldChunks[1], oldChunks[6], oldChunks[7])
-	newBytes := concat(newChunks[4], newChunks[5], newChunks[2], newChunks[0], newChunks[1], newChunks[6], newChunks[7])
-	if bytes.Contains(data, oldBytes) {
-		Logf("%s public key patched %X...\n", name, old[:16])
-		data = bytes.ReplaceAll(data, oldBytes, newBytes)
-		oldCodes := [][]byte{
-			mustHex("793583E2"), mustHex("FD3A83E2"), mustHex("193D83E2"),
-		}
-		newCodes := ArmLoadImm(3, binary.LittleEndian.Uint32(new[12:16]), "movt")
-		data = ReplaceChunks(oldCodes, newCodes, data, name)
-		return data
-	}
-	// Packed key table: the words are bit-packed and the stock code rebuilds
-	// word 8 from a hard-coded delta.
-	oldWords := packedWords(old)
-	newWords := packedWords(new)
-	oldJoined := joinExcept(oldWords, 8)
-	newJoined := joinExcept(newWords, 8)
-	if bytes.Contains(data, oldJoined) {
-		Logf("%s public key patched %X...\n", name, old[:16])
-		data = bytes.ReplaceAll(data, oldJoined, newJoined)
-		oldCodes := [][]byte{
-			mustHex("713783E2"), mustHex("223A83E2"), mustHex("8D3F83E2"),
-		}
-		newCodes := ArmLoadImm(3, binary.LittleEndian.Uint32(newWords[8]), "orr")
-		data = ReplaceChunks(oldCodes, newCodes, data, name)
-	}
-	return data
+	return replaceArmKey(old, new, data, name)
 }
 
 func packedWords(key []byte) [][]byte {
@@ -286,25 +619,6 @@ func chunk4(data []byte) [][]byte {
 			end = len(data)
 		}
 		out = append(out, data[i:end])
-	}
-	return out
-}
-
-func concat(parts ...[]byte) []byte {
-	var out []byte
-	for _, p := range parts {
-		out = append(out, p...)
-	}
-	return out
-}
-
-func joinExcept(words [][]byte, skip int) []byte {
-	var out []byte
-	for i, w := range words {
-		if i == skip {
-			continue
-		}
-		out = append(out, w...)
 	}
 	return out
 }

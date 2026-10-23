@@ -3,6 +3,7 @@ package patch
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"mikrotikpatch/internal/lzma"
@@ -53,25 +54,6 @@ func TestPatchLicenceBinariesLoader(t *testing.T) {
 	}}
 	if err := patchLicenceBinaries(bad, keys, "x86", "/nova/bin", nil); err == nil {
 		t.Fatal("a verifier without the stock key did not fail")
-	}
-}
-
-func TestArmLoadImm(t *testing.T) {
-	// Value 0xCFBB40A6 must load as MOVW r3,#0x40A6 / MOVT r3,#0xCFBB / NOP.
-	got := ArmLoadImm(3, 0xCFBB40A6, "movt")
-	want := []uint32{0xE30430A6, 0xE34C3FBB, 0xE1A00000}
-	for i, w := range want {
-		if v := binary.LittleEndian.Uint32(got[i]); v != w {
-			t.Errorf("movt word %d = %#x, want %#x", i, v, w)
-		}
-	}
-	// ORR style: MOVW r3,#0xA4C6 / ORR r3,r3,#0xCE0000 / ORR r3,r3,#0x43000000
-	got = ArmLoadImm(3, 0x43CEA4C6, "orr")
-	want = []uint32{0xE30A34C6, 0xE38338CE, 0xE3833443}
-	for i, w := range want {
-		if v := binary.LittleEndian.Uint32(got[i]); v != w {
-			t.Errorf("orr word %d = %#x, want %#x", i, v, w)
-		}
 	}
 }
 
@@ -225,22 +207,156 @@ func TestFindXZStreams(t *testing.T) {
 	}
 }
 
-func TestArmKeyTable(t *testing.T) {
-	// The word table order is a fixed permutation of the key's words.
-	old := make([]byte, 32)
-	newKey := make([]byte, 32)
-	for i := range old {
-		old[i] = byte(0x10 + i)
-		newKey[i] = byte(0x90 + i)
+func armTestWord(s string) []byte {
+	b := make([]byte, len(s)/2)
+	for i := range b {
+		fmt.Sscanf(s[2*i:2*i+2], "%02x", &b[i])
 	}
-	oldChunks := chunk4(old)
-	newChunks := chunk4(newKey)
-	oldBytes := concat(oldChunks[4], oldChunks[5], oldChunks[2], oldChunks[0], oldChunks[1], oldChunks[6], oldChunks[7])
-	newBytes := concat(newChunks[4], newChunks[5], newChunks[2], newChunks[0], newChunks[1], newChunks[6], newChunks[7])
-	data := append([]byte("x"), oldBytes...)
-	data = append(data, []byte("y")...)
-	got := ReplaceKeyArch(old, newKey, data, "arm", "arm64")
-	if !bytes.Equal(got, append(append([]byte("x"), newBytes...), 'y')) {
-		t.Fatalf("ARM word table replacement failed: %x", got)
+	return b
+}
+
+func armTestPut(buf []byte, off int, order []int, words [][]byte) {
+	for i, idx := range order {
+		copy(buf[off+4*i:], words[idx])
+	}
+}
+
+func armTestAddImm(reg int, imm8, rot uint32) []byte {
+	return armWord(0xE2800000 | uint32(reg)<<16 | uint32(reg)<<12 | rot<<8 | imm8)
+}
+
+func armTestLdrPc(reg, target, off int) []byte {
+	imm := target - (off + 8)
+	return armWord(0xE59F0000 | uint32(reg)<<12 | uint32(imm&0xfff))
+}
+
+func armTestStrSp(reg, imm int) []byte {
+	return armWord(0xE58D0000 | uint32(reg)<<12 | uint32(imm&0xfff))
+}
+
+var (
+	armTestOld = armTestWord("8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32")
+	armTestNew = armTestWord("c0ffee00deadbeef0123456789abcdeffedcba98765432100badf00dcafe1234")
+)
+
+func TestArmFullWordTableAnyOrder(t *testing.T) {
+	// All eight words present: the order is irrelevant and no instruction
+	// sequence has to be rewritten.
+	oldChunks := chunk4(armTestOld)
+	newChunks := chunk4(armTestNew)
+	order := []int{7, 0, 6, 1, 5, 2, 4, 3}
+	var oldBytes, newBytes []byte
+	for _, idx := range order {
+		oldBytes = append(oldBytes, oldChunks[idx]...)
+		newBytes = append(newBytes, newChunks[idx]...)
+	}
+	data := append([]byte("pre"), oldBytes...)
+	data = append(data, []byte("post")...)
+	want := append([]byte("pre"), newBytes...)
+	want = append(want, []byte("post")...)
+	if got := ReplaceKeyArch(armTestOld, armTestNew, data, "table", "arm64"); !bytes.Equal(got, want) {
+		t.Fatalf("ARM full table replacement failed:\n got %x\nwant %x", got, want)
+	}
+}
+
+func TestArmDerivedTableAnyOrder(t *testing.T) {
+	// Seven words in a shuffled order plus the stock add sequence that
+	// derives chunk3 from chunk2.  The matcher must find the table as a set
+	// and rewrite the arithmetic even though its register and position differ
+	// from the stock build.
+	oldChunks := chunk4(armTestOld)
+	newChunks := chunk4(armTestNew)
+	order := []int{6, 4, 1, 0, 7, 5, 2}
+	const tableOff = 0x200
+	const insOff = tableOff - 64
+	data := make([]byte, tableOff+4*len(order)+32)
+	armTestPut(data, tableOff, order, oldChunks)
+
+	basePos := -1
+	for i, idx := range order {
+		if idx == 2 {
+			basePos = i
+		}
+	}
+	baseOff := tableOff + 4*basePos
+	copy(data[insOff:], armTestLdrPc(5, baseOff, insOff))
+	copy(data[insOff+4:], armTestAddImm(5, 0x79, 5))   // + 0x1e400000
+	copy(data[insOff+8:], armTestAddImm(5, 0xfd, 10))  // + 0x000fd000
+	copy(data[insOff+12:], armTestAddImm(5, 0x19, 13)) // + 0x00000640
+	copy(data[insOff+16:], armTestStrSp(5, 12))
+
+	got := ReplaceKeyArch(armTestOld, armTestNew, data, "derived", "arm64")
+	want := append([]byte(nil), data...)
+	armTestPut(want, tableOff, order, newChunks)
+	word := binary.LittleEndian.Uint32(newChunks[3])
+	copy(want[insOff+4:], armMovwInsn(5, uint16(word)))
+	copy(want[insOff+8:], armMovtInsn(5, uint16(word>>16)))
+	copy(want[insOff+12:], armNop())
+	if !bytes.Equal(got, want) {
+		t.Fatalf("ARM derived table replacement failed:\n got %x\nwant %x", got, want)
+	}
+}
+
+func TestArmDerivedTableAtomic(t *testing.T) {
+	// A table match without a usable derived-word sequence must not change
+	// anything: a half-patched key would be worse than no patch at all.
+	oldChunks := chunk4(armTestOld)
+	order := []int{6, 4, 1, 0, 7, 5, 2}
+	data := make([]byte, 0x200+4*len(order)+32)
+	armTestPut(data, 0x200, order, oldChunks)
+	if got := ReplaceKeyArch(armTestOld, armTestNew, data, "atomic", "arm64"); !bytes.Equal(got, data) {
+		t.Fatal("ARM table was patched without a derived-word rewrite")
+	}
+}
+
+func TestArmPackedTableAnyOrder(t *testing.T) {
+	oldWords := packedWords(armTestOld)
+	newWords := packedWords(armTestNew)
+	order := []int{9, 4, 0, 8, 1, 5, 2, 6, 3, 7}
+	var oldBytes, newBytes []byte
+	for _, idx := range order {
+		oldBytes = append(oldBytes, oldWords[idx]...)
+		newBytes = append(newBytes, newWords[idx]...)
+	}
+	data := append([]byte("pre"), oldBytes...)
+	data = append(data, []byte("post")...)
+	want := append([]byte("pre"), newBytes...)
+	want = append(want, []byte("post")...)
+	if got := ReplaceKeyArch(armTestOld, armTestNew, data, "packed", "arm64"); !bytes.Equal(got, want) {
+		t.Fatalf("ARM packed table replacement failed:\n got %x\nwant %x", got, want)
+	}
+}
+
+func TestArmPackedDerivedTable(t *testing.T) {
+	oldWords := packedWords(armTestOld)
+	newWords := packedWords(armTestNew)
+	order := []int{6, 4, 0, 9, 1, 5, 2, 7, 3}
+	const tableOff = 0x200
+	const insOff = tableOff - 64
+	data := make([]byte, tableOff+4*len(order)+32)
+	armTestPut(data, tableOff, order, oldWords)
+
+	basePos := -1
+	for i, idx := range order {
+		if idx == 7 {
+			basePos = i
+		}
+	}
+	baseOff := tableOff + 4*basePos
+	copy(data[insOff:], armTestLdrPc(4, baseOff, insOff))
+	copy(data[insOff+4:], armTestAddImm(4, 0x71, 7))   // + 0x01c40000
+	copy(data[insOff+8:], armTestAddImm(4, 0x22, 10))  // + 0x00022000
+	copy(data[insOff+12:], armTestAddImm(4, 0x8d, 15)) // + 0x00000234
+	copy(data[insOff+16:], armTestStrSp(4, 16))
+
+	got := ReplaceKeyArch(armTestOld, armTestNew, data, "packed-derived", "arm64")
+	want := append([]byte(nil), data...)
+	armTestPut(want, tableOff, order, newWords)
+	word := binary.LittleEndian.Uint32(newWords[8])
+	copy(want[insOff+4:], armMovwInsn(4, uint16(word)))
+	copy(want[insOff+8:], armMovtInsn(4, uint16(word>>16)))
+	copy(want[insOff+12:], armNop())
+	if !bytes.Equal(got, want) {
+		t.Fatalf("ARM packed derived table replacement failed:\n got %x\nwant %x", got, want)
 	}
 }
