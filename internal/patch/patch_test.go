@@ -147,6 +147,35 @@ func TestReplaceKeySynthetic(t *testing.T) {
 	}
 }
 
+func TestReplaceKeyArchScheduledChunks(t *testing.T) {
+	// RouterOS 7.25's x86 compiler scheduled the licence-key loads with words
+	// 6 and 5 swapped.  The resulting stack image is unchanged, but the bytes
+	// in the instruction stream are no longer in key order.
+	old := mustHex("8E1067E4305FCDC0CFBF95C10F96E5DFE8C49AEF486BD1A4E2E96C27F01E3E32")
+	newKey := mustHex("c0ffee00deadbeef0123456789abcdeffedcba98765432100badf00dcafe1234")
+	oldChunks := chunk4(old)
+	newChunks := chunk4(newKey)
+	order := []int{0, 1, 2, 3, 4, 6, 5, 7}
+	var data, want []byte
+	for i, idx := range order {
+		var insn []byte
+		if i%2 == 0 {
+			insn = []byte{0xC7, 0x45, byte(0x80 - 4*i)} // mov dword [ebp+disp8], imm32
+		} else {
+			insn = []byte{0xC7, 0x85, 0x78, 0xFF, 0xFF, 0xFF} // mov dword [ebp+disp32], imm32
+		}
+		data = append(data, insn...)
+		data = append(data, oldChunks[idx]...)
+		want = append(want, insn...)
+		want = append(want, newChunks[idx]...)
+	}
+
+	got := ReplaceKeyArch(old, newKey, data, "mode", "x86")
+	if !bytes.Equal(got, want) {
+		t.Fatalf("scheduled key was not patched:\n got %x\nwant %x", got, want)
+	}
+}
+
 func TestPatchInitrdXZ(t *testing.T) {
 	old := bytes.Repeat([]byte{0x41}, 32)
 	newKey := bytes.Repeat([]byte{0x42}, 32)

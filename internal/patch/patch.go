@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -118,6 +119,79 @@ func matchGreedy(data []byte, start int, chunks [][]byte) (int, [][]byte, bool) 
 	return 0, nil, false
 }
 
+// unorderedKeySpan bounds the distance between the first and last chunk of one
+// key.  The x86 binaries materialise the key as eight independent
+// mov-immediate instructions; even the disp32 form (10 bytes each) leaves
+// plenty of room in this window.
+const unorderedKeySpan = 256
+
+type chunkHit struct {
+	offset int
+	chunk  int
+}
+
+// ReplaceChunksUnordered replaces a set of chunks that occur close together in
+// an arbitrary order.
+//
+// The x86 licence verifiers load the key as eight independent mov-immediate
+// instructions.  The compiler may schedule those in any order, and RouterOS
+// 7.25 does: chunks 5 and 6 are emitted swapped even though the resulting
+// on-stack key is identical.  An ordered search therefore misses the key, so
+// accept a window that holds every chunk exactly once.
+func ReplaceChunksUnordered(oldChunks, newChunks [][]byte, data []byte, name string) []byte {
+	if len(oldChunks) < 2 || len(oldChunks) != len(newChunks) {
+		return data
+	}
+	var hits []chunkHit
+	for i, chunk := range oldChunks {
+		for pos := 0; ; {
+			j := bytes.Index(data[pos:], chunk)
+			if j < 0 {
+				break
+			}
+			hits = append(hits, chunkHit{offset: pos + j, chunk: i})
+			pos += j + 1
+		}
+	}
+	if len(hits) < len(oldChunks) {
+		return data
+	}
+	sort.Slice(hits, func(i, j int) bool { return hits[i].offset < hits[j].offset })
+
+	replace := make(map[int]int) // chunk offset -> chunk index
+	for start := 0; start+len(oldChunks) <= len(hits); start++ {
+		window := hits[start : start+len(oldChunks)]
+		if window[len(window)-1].offset+len(oldChunks[0])-window[0].offset > unorderedKeySpan {
+			continue
+		}
+		seen := make([]bool, len(oldChunks))
+		complete := true
+		for _, h := range window {
+			if seen[h.chunk] {
+				complete = false
+				break
+			}
+			seen[h.chunk] = true
+		}
+		if !complete {
+			continue
+		}
+		for _, h := range window {
+			replace[h.offset] = h.chunk
+		}
+		start += len(oldChunks) - 1
+	}
+	if len(replace) == 0 {
+		return data
+	}
+	out := append([]byte(nil), data...)
+	for offset, chunk := range replace {
+		copy(out[offset:], newChunks[chunk])
+	}
+	Logf("%s public key patched %X...\n", name, oldChunks[0])
+	return out
+}
+
 // keyMap is the byte order of the packed key table.
 var keyMap = []int{28, 19, 25, 16, 14, 3, 24, 15, 22, 8, 6, 17, 11, 7, 9, 23,
 	18, 13, 10, 0, 26, 21, 2, 5, 20, 30, 31, 4, 27, 29, 1, 12}
@@ -133,6 +207,12 @@ func ReplaceKeyArch(old, new []byte, data []byte, name, archEnv string) []byte {
 	newChunks := chunk4(new)
 	data = ReplaceChunks(oldChunks, newChunks, data, name)
 
+	arch := strings.ReplaceAll(archEnv, "-", "")
+	if arch != "arm" && arch != "arm64" {
+		// x86 code may load the key words in a compiler-scheduled order.
+		data = ReplaceChunksUnordered(oldChunks, newChunks, data, name)
+	}
+
 	// The byte-packed key table stores the key bytes in a shuffled order.
 	oldShuffled := make([][]byte, len(keyMap))
 	newShuffled := make([][]byte, len(keyMap))
@@ -142,7 +222,6 @@ func ReplaceKeyArch(old, new []byte, data []byte, name, archEnv string) []byte {
 	}
 	data = ReplaceChunks(oldShuffled, newShuffled, data, name)
 
-	arch := strings.ReplaceAll(archEnv, "-", "")
 	if arch != "arm" && arch != "arm64" {
 		return data
 	}
